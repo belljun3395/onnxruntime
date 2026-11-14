@@ -5,6 +5,7 @@
 #include <jni.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "onnxruntime/core/session/onnxruntime_c_api.h"
 #include "OrtJniUtil.h"
 #include "ai_onnxruntime_OrtSession.h"
@@ -476,6 +477,308 @@ cleanup_input_names:
   free((void*)inputNames);
 
   return outputArray;
+}
+
+/*
+ * State for a pending OrtApi::RunAsync call. OrtApi::RunAsync keeps pointers to the name and value
+ * arrays until the callback runs, so they are copied into native memory owned by this struct.
+ */
+typedef struct {
+  JavaVM* jvm;
+  const OrtApi* api;
+  jobject asyncRun;        // Global reference to the OrtSession.AsyncRun object.
+  jmethodID onComplete;    // AsyncRun.onComplete(long[], int, String)
+  size_t numInputs;
+  size_t numOutputs;
+  char** inputNames;
+  char** outputNames;
+  const OrtValue** inputValues;
+  OrtValue** outputValues;  // Written by ORT, passed back to the callback.
+  const OrtValue** pinnedOutputs;  // Copy of the caller-provided outputs, NULL where ORT allocates.
+} OrtJniAsyncRunState;
+
+static void releaseAsyncRunState(JNIEnv* jniEnv, OrtJniAsyncRunState* state) {
+  if (state == NULL) {
+    return;
+  }
+  if (state->asyncRun != NULL && jniEnv != NULL) {
+    (*jniEnv)->DeleteGlobalRef(jniEnv, state->asyncRun);
+  }
+  if (state->inputNames != NULL) {
+    for (size_t i = 0; i < state->numInputs; i++) {
+      free(state->inputNames[i]);
+    }
+    free(state->inputNames);
+  }
+  if (state->outputNames != NULL) {
+    for (size_t i = 0; i < state->numOutputs; i++) {
+      free(state->outputNames[i]);
+    }
+    free(state->outputNames);
+  }
+  free((void*)state->inputValues);
+  free(state->outputValues);
+  free((void*)state->pinnedOutputs);
+  free(state);
+}
+
+static char* copyJavaString(JNIEnv* jniEnv, jobjectArray array, jsize index) {
+  jstring javaString = (jstring)(*jniEnv)->GetObjectArrayElement(jniEnv, array, index);
+  if (javaString == NULL) {
+    return NULL;
+  }
+  const char* utf = (*jniEnv)->GetStringUTFChars(jniEnv, javaString, NULL);
+  char* copy = NULL;
+  if (utf != NULL) {
+    size_t len = strlen(utf) + 1;
+    copy = malloc(len);
+    if (copy != NULL) {
+      memcpy(copy, utf, len);
+    }
+    (*jniEnv)->ReleaseStringUTFChars(jniEnv, javaString, utf);
+  }
+  (*jniEnv)->DeleteLocalRef(jniEnv, javaString);
+  return copy;
+}
+
+/*
+ * Releases the OrtValues ORT allocated for a run whose results cannot be handed to Java.
+ * Preallocated (pinned) outputs belong to Java and are not released.
+ */
+static void releaseUnclaimedOutputs(const OrtApi* api, OrtValue** outputs, const OrtValue* const* preallocated,
+                                    size_t numOutputs) {
+  if (outputs == NULL) {
+    return;
+  }
+  for (size_t i = 0; i < numOutputs; i++) {
+    if (outputs[i] != NULL && outputs[i] != preallocated[i]) {
+      api->ReleaseValue(outputs[i]);
+    }
+  }
+}
+
+/*
+ * The RunAsyncCallbackFn. Runs on an ORT intra-op thread which is not a Java thread, so it attaches
+ * to the JVM for the duration of the call and detaches afterwards if it attached.
+ */
+static void ortJniRunAsyncCallback(void* userData, OrtValue** outputs, size_t numOutputs, OrtStatusPtr status) {
+  OrtJniAsyncRunState* state = (OrtJniAsyncRunState*)userData;
+  const OrtApi* api = state->api;
+  JavaVM* jvm = state->jvm;
+  JNIEnv* jniEnv = NULL;
+  int attached = 0;
+
+  jint envResult = (*jvm)->GetEnv(jvm, (void**)&jniEnv, JNI_VERSION_1_6);
+  if (envResult == JNI_EDETACHED) {
+    JavaVMAttachArgs args;
+    args.version = JNI_VERSION_1_6;
+    args.name = "onnxruntime-run-async-callback";
+    args.group = NULL;
+#ifdef __ANDROID__
+    envResult = (*jvm)->AttachCurrentThreadAsDaemon(jvm, &jniEnv, &args);
+#else
+    envResult = (*jvm)->AttachCurrentThreadAsDaemon(jvm, (void**)&jniEnv, &args);
+#endif
+    attached = (envResult == JNI_OK);
+  }
+  if (envResult != JNI_OK || jniEnv == NULL) {
+    // Cannot reach the JVM, so the future can never be completed. Free what we can.
+    fprintf(stderr, "onnxruntime: failed to attach a RunAsync callback thread to the JVM\n");
+    if (status != NULL) {
+      api->ReleaseStatus(status);
+    }
+    releaseUnclaimedOutputs(api, outputs, (const OrtValue* const*)state->pinnedOutputs, numOutputs);
+    // The global reference leaks here as there is no JNIEnv to delete it with.
+    state->asyncRun = NULL;
+    releaseAsyncRunState(NULL, state);
+    return;
+  }
+
+  // Push a local frame so the local references created here are released before detaching.
+  if ((*jniEnv)->PushLocalFrame(jniEnv, 4) == 0) {
+    jlongArray handles = NULL;
+    jint errorCode = 0;
+    jstring message = NULL;
+    if (status != NULL) {
+      errorCode = convertErrorCode(api->GetErrorCode(status));
+      message = (*jniEnv)->NewStringUTF(jniEnv, api->GetErrorMessage(status));
+      if (message == NULL) {
+        // Out of memory: report the error code without a message.
+        (*jniEnv)->ExceptionClear(jniEnv);
+      }
+      api->ReleaseStatus(status);
+      status = NULL;
+    } else {
+      handles = (*jniEnv)->NewLongArray(jniEnv, safecast_size_t_to_jsize(numOutputs));
+      if (handles != NULL) {
+        // SetLongArrayRegion copies without exposing a pointer, so there is no NULL case to handle.
+        for (size_t i = 0; i < numOutputs; i++) {
+          jlong handle = (jlong)outputs[i];
+          (*jniEnv)->SetLongArrayRegion(jniEnv, handles, safecast_size_t_to_jsize(i), 1, &handle);
+        }
+      } else {
+        // Out of memory: report a failure and release the outputs.
+        (*jniEnv)->ExceptionClear(jniEnv);
+        releaseUnclaimedOutputs(api, outputs, (const OrtValue* const*)state->pinnedOutputs, numOutputs);
+        errorCode = convertErrorCode(ORT_FAIL);
+      }
+    }
+    (*jniEnv)->CallVoidMethod(jniEnv, state->asyncRun, state->onComplete, handles, errorCode, message);
+    if ((*jniEnv)->ExceptionCheck(jniEnv)) {
+      // onComplete catches everything it can, so this is an Error such as OutOfMemoryError.
+      (*jniEnv)->ExceptionDescribe(jniEnv);
+      (*jniEnv)->ExceptionClear(jniEnv);
+    }
+    (*jniEnv)->PopLocalFrame(jniEnv, NULL);
+  } else {
+    (*jniEnv)->ExceptionDescribe(jniEnv);
+    (*jniEnv)->ExceptionClear(jniEnv);
+    if (status != NULL) {
+      api->ReleaseStatus(status);
+    }
+    releaseUnclaimedOutputs(api, outputs, (const OrtValue* const*)state->pinnedOutputs, numOutputs);
+  }
+
+  releaseAsyncRunState(jniEnv, state);
+  if (attached) {
+    (*jvm)->DetachCurrentThread(jvm);
+  }
+}
+
+/*
+ * Class:     ai_onnxruntime_OrtSession
+ * Method:    runAsync
+ * Signature: (JJ[Ljava/lang/String;[JJ[Ljava/lang/String;J[JJLai/onnxruntime/OrtSession$AsyncRun;)V
+ */
+JNIEXPORT void JNICALL Java_ai_onnxruntime_OrtSession_runAsync(JNIEnv* jniEnv, jobject jobj, jlong apiHandle,
+                                                              jlong sessionHandle, jobjectArray inputNamesArr,
+                                                              jlongArray tensorArr, jlong numInputs,
+                                                              jobjectArray outputNamesArr, jlong numOutputs,
+                                                              jlongArray outputHandlesArr, jlong runOptionsHandle,
+                                                              jobject asyncRun) {
+  (void)jobj;  // Required JNI parameter not needed by functions which don't need to access their host object.
+  const OrtApi* api = (const OrtApi*)apiHandle;
+  OrtSession* session = (OrtSession*)sessionHandle;
+  OrtRunOptions* runOptions = (OrtRunOptions*)runOptionsHandle;
+
+  OrtJniAsyncRunState* state = calloc(1, sizeof(OrtJniAsyncRunState));
+  if (state == NULL) {
+    throwOrtException(jniEnv, convertErrorCode(ORT_FAIL), "Not enough memory");
+    return;
+  }
+  state->api = api;
+  state->numInputs = (size_t)numInputs;
+  state->numOutputs = (size_t)numOutputs;
+  if ((*jniEnv)->GetJavaVM(jniEnv, &state->jvm) != JNI_OK) {
+    releaseAsyncRunState(jniEnv, state);
+    throwOrtException(jniEnv, convertErrorCode(ORT_FAIL), "Failed to access the JVM for RunAsync");
+    return;
+  }
+
+  jclass asyncRunClass = (*jniEnv)->GetObjectClass(jniEnv, asyncRun);
+  state->onComplete = (*jniEnv)->GetMethodID(jniEnv, asyncRunClass, "onComplete", "([JILjava/lang/String;)V");
+  (*jniEnv)->DeleteLocalRef(jniEnv, asyncRunClass);
+  if (state->onComplete == NULL) {
+    releaseAsyncRunState(jniEnv, state);
+    return;  // NoSuchMethodError pending
+  }
+
+  // calloc so the arrays are zeroed and safe to free on a partial failure. Use at least one element
+  // so a zero-input model still gets a non-NULL array.
+  state->inputNames = calloc(numInputs > 0 ? (size_t)numInputs : 1, sizeof(char*));
+  state->inputValues = calloc(numInputs > 0 ? (size_t)numInputs : 1, sizeof(OrtValue*));
+  state->outputNames = calloc((size_t)numOutputs, sizeof(char*));
+  state->outputValues = calloc((size_t)numOutputs, sizeof(OrtValue*));
+  state->pinnedOutputs = calloc((size_t)numOutputs, sizeof(OrtValue*));
+  if (state->inputNames == NULL || state->inputValues == NULL || state->outputNames == NULL ||
+      state->outputValues == NULL || state->pinnedOutputs == NULL) {
+    releaseAsyncRunState(jniEnv, state);
+    throwOrtException(jniEnv, convertErrorCode(ORT_FAIL), "Not enough memory");
+    return;
+  }
+
+  // GetLongArrayRegion copies element by element, which also works on 32-bit platforms where a
+  // jlong and a pointer differ in size.
+  for (jsize i = 0; i < (jsize)numInputs; i++) {
+    jlong handle = 0;
+    (*jniEnv)->GetLongArrayRegion(jniEnv, tensorArr, i, 1, &handle);
+    state->inputValues[i] = (const OrtValue*)handle;
+  }
+  for (jsize i = 0; i < (jsize)numOutputs; i++) {
+    jlong handle = 0;
+    (*jniEnv)->GetLongArrayRegion(jniEnv, outputHandlesArr, i, 1, &handle);
+    state->outputValues[i] = (OrtValue*)handle;
+    state->pinnedOutputs[i] = (const OrtValue*)handle;
+  }
+  if ((*jniEnv)->ExceptionCheck(jniEnv)) {
+    releaseAsyncRunState(jniEnv, state);
+    return;  // ArrayIndexOutOfBoundsException pending
+  }
+
+  for (jsize i = 0; i < (jsize)numInputs; i++) {
+    state->inputNames[i] = copyJavaString(jniEnv, inputNamesArr, i);
+    if (state->inputNames[i] == NULL) {
+      releaseAsyncRunState(jniEnv, state);
+      if (!(*jniEnv)->ExceptionCheck(jniEnv)) {
+        throwOrtException(jniEnv, convertErrorCode(ORT_FAIL), "Not enough memory");
+      }
+      return;
+    }
+  }
+  for (jsize i = 0; i < (jsize)numOutputs; i++) {
+    state->outputNames[i] = copyJavaString(jniEnv, outputNamesArr, i);
+    if (state->outputNames[i] == NULL) {
+      releaseAsyncRunState(jniEnv, state);
+      if (!(*jniEnv)->ExceptionCheck(jniEnv)) {
+        throwOrtException(jniEnv, convertErrorCode(ORT_FAIL), "Not enough memory");
+      }
+      return;
+    }
+  }
+
+  // The global reference keeps the AsyncRun, and through it the input tensors, pinned outputs and
+  // run options, reachable until the callback deletes it.
+  state->asyncRun = (*jniEnv)->NewGlobalRef(jniEnv, asyncRun);
+  if (state->asyncRun == NULL) {
+    releaseAsyncRunState(jniEnv, state);
+    return;  // OutOfMemoryError pending
+  }
+
+  OrtStatus* status = api->RunAsync(session, runOptions, (const char* const*)state->inputNames,
+                                    state->inputValues, (size_t)numInputs,
+                                    (const char* const*)state->outputNames, (size_t)numOutputs,
+                                    state->outputValues, ortJniRunAsyncCallback, state);
+  if (status != NULL) {
+    // Scheduling failed, so the callback will never run and the state is still ours.
+    releaseAsyncRunState(jniEnv, state);
+    checkOrtStatus(jniEnv, api, status);
+  }
+}
+
+/*
+ * Class:     ai_onnxruntime_OrtSession
+ * Method:    wrapOutput
+ * Signature: (JJJ)Lai/onnxruntime/OnnxValue;
+ */
+JNIEXPORT jobject JNICALL Java_ai_onnxruntime_OrtSession_wrapOutput(JNIEnv* jniEnv, jclass jclazz, jlong apiHandle,
+                                                                   jlong allocatorHandle, jlong valueHandle) {
+  (void)jclazz;  // Required JNI parameter not needed by functions which don't need to access their host object.
+  // Called from Java, so FindClass inside the conversion uses the class loader that loaded OrtSession,
+  // even on an attached ORT thread.
+  return convertOrtValueToONNXValue(jniEnv, (const OrtApi*)apiHandle, (OrtAllocator*)allocatorHandle,
+                                    (OrtValue*)valueHandle);
+}
+
+/*
+ * Class:     ai_onnxruntime_OrtSession
+ * Method:    releaseOutput
+ * Signature: (JJ)V
+ */
+JNIEXPORT void JNICALL Java_ai_onnxruntime_OrtSession_releaseOutput(JNIEnv* jniEnv, jclass jclazz, jlong apiHandle,
+                                                                    jlong valueHandle) {
+  (void)jniEnv;
+  (void)jclazz;  // Required JNI parameters not needed by functions which don't need to access their host object.
+  ((const OrtApi*)apiHandle)->ReleaseValue((OrtValue*)valueHandle);
 }
 
 /*

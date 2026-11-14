@@ -23,6 +23,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 /**
@@ -62,6 +66,15 @@ public class OrtSession implements AutoCloseable {
       epContextDataReadCallbackRegistration;
 
   private boolean closed = false;
+
+  /** The number of async runs which have been started but whose callback has not finished. */
+  private final AtomicInteger pendingAsyncRuns = new AtomicInteger();
+
+  /**
+   * Guards the closed check plus increment of {@link #pendingAsyncRuns} in {@code runAsync} against
+   * {@link #close()}, so an async run can never start on a freed session.
+   */
+  private final Object asyncLifecycleLock = new Object();
 
   @FunctionalInterface
   private interface NativeSessionCreator {
@@ -422,81 +435,414 @@ public class OrtSession implements AutoCloseable {
       RunOptions runOptions)
       throws OrtException {
     if (!closed) {
-      if ((inputs.isEmpty() && (numInputs != 0)) || (inputs.size() > numInputs)) {
-        throw new OrtException(
-            "Unexpected number of inputs, expected [1," + numInputs + ") found " + inputs.size());
-      }
-      int totalOutputs = requestedOutputs.size() + pinnedOutputs.size();
-      if ((totalOutputs == 0) || (totalOutputs > numOutputs)) {
-        throw new OrtException(
-            "Unexpected number of requestedOutputs & pinnedOutputs, expected [1,"
-                + numOutputs
-                + ") found "
-                + totalOutputs);
-      }
-      String[] inputNamesArray = new String[inputs.size()];
-      long[] inputHandles = new long[inputs.size()];
-      int i = 0;
-      for (Map.Entry<String, ? extends OnnxTensorLike> t : inputs.entrySet()) {
-        if (inputNames.contains(t.getKey())) {
-          inputNamesArray[i] = t.getKey();
-          inputHandles[i] = t.getValue().getNativeHandle();
-          i++;
-        } else {
-          throw new OrtException(
-              "Unknown input name " + t.getKey() + ", expected one of " + inputNames.toString());
-        }
-      }
-      String[] outputNamesArray = new String[requestedOutputs.size() + pinnedOutputs.size()];
-      OnnxValue[] outputValues = new OnnxValue[outputNamesArray.length];
-      long[] outputHandles = new long[outputNamesArray.length];
-      i = 0;
-      for (Map.Entry<String, ? extends OnnxValue> e : pinnedOutputs.entrySet()) {
-        if (outputNames.contains(e.getKey())) {
-          outputNamesArray[i] = e.getKey();
-          outputValues[i] = e.getValue();
-          outputHandles[i] = getHandle(e.getValue());
-          i++;
-        } else {
-          throw new OrtException(
-              "Unknown output name " + e.getKey() + ", expected one of " + outputNames.toString());
-        }
-      }
-      for (String s : requestedOutputs) {
-        if (outputNames.contains(s)) {
-          if (!pinnedOutputs.containsKey(s)) {
-            outputNamesArray[i] = s;
-            // outputValues and outputHandles can be null/0 for these outputs as ORT will allocate
-            // them.
-            i++;
-          } else {
-            throw new OrtException(
-                "Output '"
-                    + s
-                    + "' was found in both the requested outputs and the pinned outputs");
-          }
-        } else {
-          throw new OrtException(
-              "Unknown output name " + s + ", expected one of " + outputNames.toString());
-        }
-      }
+      PreparedRun prepared = prepareRun(inputs, requestedOutputs, pinnedOutputs);
       long runOptionsHandle = runOptions == null ? 0 : runOptions.getNativeHandle();
       boolean[] ownedByResult =
           run(
               OnnxRuntime.ortApiHandle,
               nativeHandle,
               allocator.handle,
-              inputNamesArray,
-              inputHandles,
-              inputNamesArray.length,
-              outputNamesArray,
-              outputNamesArray.length,
-              outputValues,
-              outputHandles,
+              prepared.inputNames,
+              prepared.inputHandles,
+              prepared.inputNames.length,
+              prepared.outputNames,
+              prepared.outputNames.length,
+              prepared.outputValues,
+              prepared.outputHandles,
               runOptionsHandle);
-      return new Result(outputNamesArray, outputValues, ownedByResult);
+      return new Result(prepared.outputNames, prepared.outputValues, ownedByResult);
     } else {
       throw new IllegalStateException("Trying to score a closed OrtSession.");
+    }
+  }
+
+  /**
+   * Scores an input feed dict asynchronously, returning all inferred outputs.
+   *
+   * <p>See {@link #runAsync(Map, Set, Map, RunOptions, Executor)} for the threading and lifetime
+   * rules.
+   *
+   * @param inputs The inputs to score.
+   * @return A future which completes with the inferred outputs.
+   * @throws OrtException If the run could not be started.
+   */
+  public CompletableFuture<Result> runAsync(Map<String, ? extends OnnxTensorLike> inputs)
+      throws OrtException {
+    return runAsync(inputs, outputNames, Collections.emptyMap(), null, null);
+  }
+
+  /**
+   * Scores an input feed dict asynchronously, returning all inferred outputs.
+   *
+   * <p>See {@link #runAsync(Map, Set, Map, RunOptions, Executor)} for the threading and lifetime
+   * rules.
+   *
+   * @param inputs The inputs to score.
+   * @param runOptions The RunOptions to control this run, may be null.
+   * @return A future which completes with the inferred outputs.
+   * @throws OrtException If the run could not be started.
+   */
+  public CompletableFuture<Result> runAsync(
+      Map<String, ? extends OnnxTensorLike> inputs, RunOptions runOptions) throws OrtException {
+    return runAsync(inputs, outputNames, Collections.emptyMap(), runOptions, null);
+  }
+
+  /**
+   * Scores an input feed dict asynchronously, returning the requested outputs.
+   *
+   * <p>See {@link #runAsync(Map, Set, Map, RunOptions, Executor)} for the threading and lifetime
+   * rules.
+   *
+   * @param inputs The inputs to score.
+   * @param requestedOutputs The requested outputs.
+   * @param runOptions The RunOptions to control this run, may be null.
+   * @return A future which completes with the inferred outputs.
+   * @throws OrtException If the run could not be started.
+   */
+  public CompletableFuture<Result> runAsync(
+      Map<String, ? extends OnnxTensorLike> inputs,
+      Set<String> requestedOutputs,
+      RunOptions runOptions)
+      throws OrtException {
+    return runAsync(inputs, requestedOutputs, Collections.emptyMap(), runOptions, null);
+  }
+
+  /**
+   * Scores an input feed dict asynchronously using {@code OrtApi::RunAsync}.
+   *
+   * <p>The model runs on a thread owned by this session's intra-op thread pool, so the calling
+   * thread does not block in native code. This is useful for virtual threads: joining the returned
+   * future parks the virtual thread and releases its carrier, whereas {@link #run(Map)} keeps the
+   * carrier pinned in native code for the whole inference.
+   *
+   * <p>Requirements and rules:
+   *
+   * <ul>
+   *   <li>The intra-op thread pool used by this session must have at least two threads, otherwise
+   *       this method throws {@link OrtException}. Setting {@link
+   *       SessionOptions#setIntraOpNumThreads(int)} to 1 disables async runs.
+   *   <li>The input tensors, the pinned outputs and the run options are kept strongly reachable
+   *       until the future completes, but they must not be closed before then.
+   *   <li>The session must not be closed while an async run is pending; {@link #close()} throws
+   *       {@link IllegalStateException} in that case.
+   *   <li>If {@code runOptions} is null a private {@link RunOptions} is created for the run, and
+   *       {@link CompletableFuture#cancel(boolean)} sets its terminate flag so the native run stops
+   *       at the next node boundary. If the caller supplies run options, cancelling the future does
+   *       not touch them; call {@link RunOptions#setTerminate(boolean)} directly instead.
+   *   <li>If the run completes after the future was cancelled, the outputs are closed.
+   * </ul>
+   *
+   * <p>The future is completed via {@code completionExecutor}, or {@link ForkJoinPool#commonPool()}
+   * when it is null, so dependent stages never run on an ONNX Runtime thread. Pass {@code
+   * Runnable::run} to complete directly on the ONNX Runtime thread, in which case dependent stages
+   * must not block or close this session.
+   *
+   * <p>Note: pinned outputs are not owned by the {@link Result} object, and are <b>not</b> closed
+   * when the result object is closed.
+   *
+   * @param inputs The inputs to score.
+   * @param requestedOutputs The requested outputs which ORT will allocate.
+   * @param pinnedOutputs The requested outputs which the user has allocated.
+   * @param runOptions The RunOptions to control this run, may be null.
+   * @param completionExecutor The executor used to complete the future, may be null.
+   * @return A future which completes with the inferred outputs, or exceptionally with an {@link
+   *     OrtException} if the run failed.
+   * @throws OrtException If the run could not be started, the input or output names are invalid, or
+   *     if there are zero or too many inputs or outputs.
+   */
+  public CompletableFuture<Result> runAsync(
+      Map<String, ? extends OnnxTensorLike> inputs,
+      Set<String> requestedOutputs,
+      Map<String, ? extends OnnxValue> pinnedOutputs,
+      RunOptions runOptions,
+      Executor completionExecutor)
+      throws OrtException {
+    PreparedRun prepared = prepareRun(inputs, requestedOutputs, pinnedOutputs);
+    RunOptions ownedRunOptions = runOptions == null ? new RunOptions() : null;
+    RunOptions effectiveRunOptions = runOptions == null ? ownedRunOptions : runOptions;
+    AsyncRun asyncRun =
+        new AsyncRun(
+            this,
+            prepared,
+            new ArrayList<Object>(inputs.values()),
+            new ArrayList<Object>(pinnedOutputs.values()),
+            effectiveRunOptions,
+            ownedRunOptions,
+            completionExecutor == null ? ForkJoinPool.commonPool() : completionExecutor);
+    synchronized (asyncLifecycleLock) {
+      if (closed) {
+        if (ownedRunOptions != null) {
+          ownedRunOptions.close();
+        }
+        throw new IllegalStateException("Trying to score a closed OrtSession.");
+      }
+      pendingAsyncRuns.incrementAndGet();
+    }
+    try {
+      runAsync(
+          OnnxRuntime.ortApiHandle,
+          nativeHandle,
+          prepared.inputNames,
+          prepared.inputHandles,
+          prepared.inputNames.length,
+          prepared.outputNames,
+          prepared.outputNames.length,
+          prepared.outputHandles,
+          effectiveRunOptions.getNativeHandle(),
+          asyncRun);
+    } catch (Throwable e) {
+      // The native call failed before scheduling (including errors such as OutOfMemoryError from
+      // NewGlobalRef), so the callback will never run.
+      pendingAsyncRuns.decrementAndGet();
+      if (ownedRunOptions != null) {
+        ownedRunOptions.close();
+      }
+      throw e;
+    }
+    return asyncRun.future;
+  }
+
+  /**
+   * Validates the arguments of a run and converts them into the arrays passed to native code.
+   *
+   * @param inputs The inputs to score.
+   * @param requestedOutputs The requested outputs which ORT will allocate.
+   * @param pinnedOutputs The requested outputs which the user has allocated.
+   * @return The prepared arrays.
+   * @throws OrtException If the input or output names are invalid, or if there are zero or too many
+   *     inputs or outputs.
+   */
+  private PreparedRun prepareRun(
+      Map<String, ? extends OnnxTensorLike> inputs,
+      Set<String> requestedOutputs,
+      Map<String, ? extends OnnxValue> pinnedOutputs)
+      throws OrtException {
+    if ((inputs.isEmpty() && (numInputs != 0)) || (inputs.size() > numInputs)) {
+      throw new OrtException(
+          "Unexpected number of inputs, expected [1," + numInputs + ") found " + inputs.size());
+    }
+    int totalOutputs = requestedOutputs.size() + pinnedOutputs.size();
+    if ((totalOutputs == 0) || (totalOutputs > numOutputs)) {
+      throw new OrtException(
+          "Unexpected number of requestedOutputs & pinnedOutputs, expected [1,"
+              + numOutputs
+              + ") found "
+              + totalOutputs);
+    }
+    String[] inputNamesArray = new String[inputs.size()];
+    long[] inputHandles = new long[inputs.size()];
+    int i = 0;
+    for (Map.Entry<String, ? extends OnnxTensorLike> t : inputs.entrySet()) {
+      if (inputNames.contains(t.getKey())) {
+        inputNamesArray[i] = t.getKey();
+        inputHandles[i] = t.getValue().getNativeHandle();
+        i++;
+      } else {
+        throw new OrtException(
+            "Unknown input name " + t.getKey() + ", expected one of " + inputNames.toString());
+      }
+    }
+    String[] outputNamesArray = new String[requestedOutputs.size() + pinnedOutputs.size()];
+    OnnxValue[] outputValues = new OnnxValue[outputNamesArray.length];
+    long[] outputHandles = new long[outputNamesArray.length];
+    i = 0;
+    for (Map.Entry<String, ? extends OnnxValue> e : pinnedOutputs.entrySet()) {
+      if (outputNames.contains(e.getKey())) {
+        outputNamesArray[i] = e.getKey();
+        outputValues[i] = e.getValue();
+        outputHandles[i] = getHandle(e.getValue());
+        i++;
+      } else {
+        throw new OrtException(
+            "Unknown output name " + e.getKey() + ", expected one of " + outputNames.toString());
+      }
+    }
+    for (String s : requestedOutputs) {
+      if (outputNames.contains(s)) {
+        if (!pinnedOutputs.containsKey(s)) {
+          outputNamesArray[i] = s;
+          // outputValues and outputHandles can be null/0 for these outputs as ORT will allocate
+          // them.
+          i++;
+        } else {
+          throw new OrtException(
+              "Output '" + s + "' was found in both the requested outputs and the pinned outputs");
+        }
+      } else {
+        throw new OrtException(
+            "Unknown output name " + s + ", expected one of " + outputNames.toString());
+      }
+    }
+    return new PreparedRun(
+        inputNamesArray, inputHandles, outputNamesArray, outputValues, outputHandles);
+  }
+
+  /** The validated arrays for a single run. */
+  private static final class PreparedRun {
+    final String[] inputNames;
+    final long[] inputHandles;
+    final String[] outputNames;
+    final OnnxValue[] outputValues;
+    final long[] outputHandles;
+
+    PreparedRun(
+        String[] inputNames,
+        long[] inputHandles,
+        String[] outputNames,
+        OnnxValue[] outputValues,
+        long[] outputHandles) {
+      this.inputNames = inputNames;
+      this.inputHandles = inputHandles;
+      this.outputNames = outputNames;
+      this.outputValues = outputValues;
+      this.outputHandles = outputHandles;
+    }
+  }
+
+  /**
+   * The Java side of a pending {@code OrtApi::RunAsync} call.
+   *
+   * <p>Native code holds a global reference to this object until {@link #onComplete} returns, so
+   * the input tensors, pinned outputs and run options referenced from here stay reachable while the
+   * native run uses them.
+   */
+  static final class AsyncRun {
+    private static final Logger logger = Logger.getLogger(AsyncRun.class.getName());
+
+    private final OrtSession session;
+    private final String[] outputNames;
+    private final OnnxValue[] outputValues;
+    private final Executor completionExecutor;
+    private final RunOptions ownedRunOptions;
+    // Strong references which keep the native memory alive until completion.
+    private List<Object> inputs;
+    private List<Object> pinnedOutputs;
+    private RunOptions runOptions;
+    private boolean finished = false;
+
+    final CompletableFuture<Result> future =
+        new CompletableFuture<Result>() {
+          @Override
+          public boolean cancel(boolean mayInterruptIfRunning) {
+            boolean cancelled = super.cancel(mayInterruptIfRunning);
+            if (cancelled) {
+              terminate();
+            }
+            return cancelled;
+          }
+        };
+
+    AsyncRun(
+        OrtSession session,
+        PreparedRun prepared,
+        List<Object> inputs,
+        List<Object> pinnedOutputs,
+        RunOptions runOptions,
+        RunOptions ownedRunOptions,
+        Executor completionExecutor) {
+      this.session = session;
+      this.outputNames = prepared.outputNames;
+      this.outputValues = prepared.outputValues;
+      this.inputs = inputs;
+      this.pinnedOutputs = pinnedOutputs;
+      this.runOptions = runOptions;
+      this.ownedRunOptions = ownedRunOptions;
+      this.completionExecutor = completionExecutor;
+    }
+
+    /** Sets the terminate flag on the run options owned by this run, if any. */
+    private synchronized void terminate() {
+      if (ownedRunOptions != null && !finished) {
+        try {
+          ownedRunOptions.setTerminate(true);
+        } catch (OrtException e) {
+          logger.warning("Failed to terminate an async run: " + e.getMessage());
+        }
+      }
+    }
+
+    /** Marks the run as finished and drops the references held for native code. */
+    private synchronized void finish() {
+      finished = true;
+      inputs = null;
+      pinnedOutputs = null;
+      runOptions = null;
+      if (ownedRunOptions != null) {
+        ownedRunOptions.close();
+      }
+    }
+
+    /**
+     * Called from native code on an ONNX Runtime intra-op thread when the run finishes.
+     *
+     * <p>On success {@code outputHandles} holds one OrtValue pointer per requested output. The
+     * values that were not pinned by the caller are owned by this method from here on.
+     *
+     * @param outputHandles The output OrtValue pointers, or null if the run failed.
+     * @param errorCode The ORT error code, zero on success.
+     * @param message The error message, or null on success.
+     */
+    void onComplete(long[] outputHandles, int errorCode, String message) {
+      Result result = null;
+      Throwable failure = null;
+      try {
+        if (errorCode != 0 || outputHandles == null) {
+          failure = new OrtException(errorCode, message == null ? "RunAsync failed" : message);
+        } else {
+          result = wrapOutputs(outputHandles);
+        }
+      } catch (Throwable t) {
+        failure = t;
+      } finally {
+        finish();
+        session.pendingAsyncRuns.decrementAndGet();
+      }
+      final Result finalResult = result;
+      final Throwable finalFailure = failure;
+      Runnable completion =
+          () -> {
+            if (finalFailure != null) {
+              future.completeExceptionally(finalFailure);
+            } else if (!future.complete(finalResult)) {
+              // The future was cancelled while the run was finishing.
+              finalResult.close();
+            }
+          };
+      try {
+        completionExecutor.execute(completion);
+      } catch (RuntimeException e) {
+        completion.run();
+      }
+    }
+
+    private Result wrapOutputs(long[] outputHandles) throws OrtException {
+      OnnxValue[] values = outputValues.clone();
+      boolean[] ownedByResult = new boolean[values.length];
+      int converted = 0;
+      try {
+        for (; converted < values.length; converted++) {
+          if (values[converted] == null && outputHandles[converted] != 0) {
+            values[converted] =
+                wrapOutput(
+                    OnnxRuntime.ortApiHandle, session.allocator.handle, outputHandles[converted]);
+            ownedByResult[converted] = true;
+          }
+        }
+      } catch (OrtException | RuntimeException e) {
+        // Release the values which were not converted, and close the ones which were.
+        for (int i = converted; i < values.length; i++) {
+          if (outputValues[i] == null && outputHandles[i] != 0) {
+            releaseOutput(OnnxRuntime.ortApiHandle, outputHandles[i]);
+          }
+        }
+        for (int i = 0; i < converted; i++) {
+          if (ownedByResult[i]) {
+            values[i].close();
+          }
+        }
+        throw e;
+      }
+      return new Result(outputNames, values, ownedByResult);
     }
   }
 
@@ -574,8 +920,18 @@ public class OrtSession implements AutoCloseable {
   @Override
   public void close() throws OrtException {
     if (!closed) {
-      closeSession(OnnxRuntime.ortApiHandle, nativeHandle);
-      closed = true;
+      synchronized (asyncLifecycleLock) {
+        if (closed) {
+          throw new IllegalStateException("Trying to close an already closed OrtSession.");
+        }
+        int pending = pendingAsyncRuns.get();
+        if (pending != 0) {
+          throw new IllegalStateException(
+              "Trying to close an OrtSession with " + pending + " pending async runs.");
+        }
+        closeSession(OnnxRuntime.ortApiHandle, nativeHandle);
+        closed = true;
+      }
       if (epContextDataReadCallbackRegistration != null) {
         epContextDataReadCallbackRegistration.release();
       }
@@ -663,6 +1019,34 @@ public class OrtSession implements AutoCloseable {
       long[] outputHandles,
       long runOptionsHandle)
       throws OrtException;
+
+  /*
+   * Starts an OrtApi::RunAsync call. The native code copies the names and handle arrays, holds a
+   * global reference to asyncRun, and calls AsyncRun.onComplete from an ONNX Runtime thread when the
+   * run finishes. If this method throws, the callback is never invoked.
+   */
+  private native void runAsync(
+      long apiHandle,
+      long nativeHandle,
+      String[] inputNamesArray,
+      long[] inputs,
+      long numInputs,
+      String[] outputNamesArray,
+      long numOutputs,
+      long[] outputHandles,
+      long runOptionsHandle,
+      AsyncRun asyncRun)
+      throws OrtException;
+
+  /*
+   * Wraps an OrtValue produced by an async run in the matching OnnxValue subclass. The OnnxValue
+   * takes ownership of the OrtValue.
+   */
+  private static native OnnxValue wrapOutput(long apiHandle, long allocatorHandle, long valueHandle)
+      throws OrtException;
+
+  /* Releases an OrtValue produced by an async run which was not wrapped. */
+  private static native void releaseOutput(long apiHandle, long valueHandle);
 
   private native long getProfilingStartTimeInNs(long apiHandle, long nativeHandle)
       throws OrtException;
