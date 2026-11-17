@@ -13,6 +13,7 @@ import org.junit.*
 import org.junit.runner.RunWith
 import java.io.IOException
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "ORTAndroidTest"
 
@@ -33,6 +34,48 @@ class SimpleTest {
     @After
     fun TearDown() {
         reportHelper.label("Stopping App")
+    }
+
+    @Test
+    fun runAsyncSigmoidModelTest() {
+        val env = OrtEnvironment.getEnvironment()
+        SessionOptions().use { opts ->
+            // RunAsync needs an intra-op thread pool.
+            opts.setIntraOpNumThreads(2)
+            env.createSession(readModel("sigmoid.ort"), opts).use { session ->
+                val inputName = session.inputNames.iterator().next()
+                val data = Array(3) { i -> Array(4) { j -> FloatArray(5) { k -> (i + j + k).toFloat() } } }
+                OnnxTensor.createTensor(env, data).use { input ->
+                    val inputs = Collections.singletonMap(inputName, input)
+                    @Suppress("UNCHECKED_CAST")
+                    val expected = session.run(inputs).use { it[0].value as Array<Array<FloatArray>> }
+
+                    session.runAsync(inputs).get(30, TimeUnit.SECONDS).use { result ->
+                        Assert.assertTrue(result[0] is OnnxTensor)
+                        @Suppress("UNCHECKED_CAST")
+                        val actual = result[0].value as Array<Array<FloatArray>>
+                        for (i in 0..2) {
+                            for (j in 0..3) {
+                                Assert.assertArrayEquals(expected[i][j], actual[i][j], 1e-6f)
+                            }
+                        }
+                    }
+
+                    val futures = (1..32).map { session.runAsync(inputs) }
+                    futures.forEach { it.get(30, TimeUnit.SECONDS).close() }
+                }
+            }
+        }
+
+        SessionOptions().use { opts ->
+            opts.setIntraOpNumThreads(1)
+            env.createSession(readModel("sigmoid.ort"), opts).use { session ->
+                OnnxTensor.createTensor(env, Array(3) { Array(4) { FloatArray(5) } }).use { input ->
+                    val inputs = Collections.singletonMap(session.inputNames.iterator().next(), input)
+                    Assert.assertThrows(OrtException::class.java) { session.runAsync(inputs) }
+                }
+            }
+        }
     }
 
     @Test
