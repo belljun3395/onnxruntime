@@ -8,7 +8,6 @@ import static ai.onnxruntime.TestHelpers.getResourcePath;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -110,7 +109,7 @@ public class RunAsyncTest {
       CompletableFuture<Result> future = session.runAsync(Collections.singletonMap("input", input));
       ExecutionException e =
           assertThrows(ExecutionException.class, () -> future.get(10, TimeUnit.SECONDS));
-      assertInstanceOf(OrtException.class, e.getCause());
+      assertTrue(e.getCause() instanceof OrtException, String.valueOf(e.getCause()));
     }
   }
 
